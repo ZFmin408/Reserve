@@ -307,12 +307,17 @@ class ReplayMixin:
         seg_ids = split_items(t.get("segment_ids"))
         segs = split_items(t.get("segments"))
         now = datetime.now()
+        acc = (self.cfg.get("session") or {}).get("acc_no")
+        if acc is None:
+            acc = (self.cfg.get("_login_cache") or {}).get("user_id", "")
         return {
             "base_url": self.base_url,
             "username": (self.cfg.get("account") or {}).get("username", ""),
             "password": (self.cfg.get("account") or {}).get("password", ""),
             "cookie": self.client.cookie_header(),
             "token": self.client.extra_headers.get("token", ""),
+            "acc_no": "" if acc is None else str(acc),
+            "user_id": "" if acc is None else str(acc),
             "seat_id": str(t.get("seat_id", "")),
             "space_id": str(t.get("space_id", "")),
             "seat_name": str(t.get("seat_name", "")),
