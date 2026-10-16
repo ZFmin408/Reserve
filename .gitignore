@@ -1,0 +1,26 @@
+# ---- runtime state / secrets (NEVER commit) ----
+config.json
+config.json.tmp
+*.har
+test.txt
+user.txt
+capture*.txt
+
+# ---- generated output ----
+logs/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# ---- local environment ----
+.venv/
+venv/
+env/
+.idea/
+.vscode/
+*.swp
+.DS_Store
+Thumbs.db
+
+# ---- keep the template ----
+!config.example.json

@@ -1,0 +1,77 @@
+{
+  "system": "ic",
+  "base_url": "http://10.20.15.27",
+  "account": {
+    "username": "",
+    "password": ""
+  },
+  "session": {
+    "auto_login": true,
+    "cookie": "",
+    "token": ""
+  },
+  "target": {
+    "space_id": "",
+    "seat_id": "",
+    "seat_name": "",
+    "reserve_date": "",
+    "start_time": "08:00",
+    "end_time": "12:00",
+    "segment_ids": "",
+    "segments": ""
+  },
+  "schedule": {
+    "mode": "at_time",
+    "fire_time": "",
+    "countdown_seconds": 0,
+    "advance_ms": 0,
+    "retry": true,
+    "retry_interval_ms": 300,
+    "retry_timeout_s": 60,
+    "prewarm": true,
+    "prewarm_advance_s": 60
+  },
+  "request": {
+    "timeout_s": 8,
+    "verify_tls": false,
+    "extra_headers": {}
+  },
+  "paths": {
+    "login": "/ic-web/login/user",
+    "seat_free": "/ic-web/seat/freeSeat",
+    "space_list": "/ic-web/space/list",
+    "booking": "/ic-web/seat/booking",
+    "booking_check": "/ic-web/seat/booking/check",
+    "user_info": "/ic-web/user/info"
+  },
+  "login": {
+    "encoding": "json",
+    "wrap": "",
+    "extra_fields": {},
+    "pwd_mode": "plain",
+    "rsa_public_key": "",
+    "rsa_padding": "pkcs1",
+    "body": "",
+    "origin": "http://10.20.15.27",
+    "referer": ""
+  },
+  "fields": {
+    "login_user": "username",
+    "login_pass": "password",
+    "seat_id": "seatId",
+    "space_id": "spaceId",
+    "date": "date",
+    "start": "startTime",
+    "end": "endTime",
+    "segment_ids": "segmentIds",
+    "segments": "segments",
+    "user_id": "userId",
+    "lib_id": "libId"
+  },
+  "replay": {
+    "enabled": false,
+    "path": "",
+    "content_type": "application/json;charset=UTF-8",
+    "body": ""
+  }
+}
