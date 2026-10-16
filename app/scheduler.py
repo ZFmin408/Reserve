@@ -55,7 +55,8 @@ class Scheduler:
     def trigger_now(self, slot_override: str = "") -> Dict[str, Any]:
         """不等定时，立即执行一次（只发一次，不重试）。
 
-        slot_override: 强制使用某个时段预设（如 "afternoon"），用于「预约验证」按钮。
+        slot_override: 内部参数，传了就强制用该时段预设；目前没有调用方会传
+                       （「预约验证」已改为使用界面当前填选的时段）。
         """
         with self._lock:
             if self._thread and self._thread.is_alive():

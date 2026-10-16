@@ -120,7 +120,10 @@ def do_login() -> Dict[str, Any]:
         acc = detail.get("accNo") or detail.get("user_id")
         if acc is not None:
             s["acc_no"] = acc
-        cfgmod.save({"session": s})
+        # accNo 用于下单 payload 的 appAccNo/resvMember，必须持久化。
+        # 用 maintain=True：这是程序自己在写会话，不能被「账号变更」逻辑清掉。
+        s["account_hash"] = cfgmod.acct_hash({**cfg, "session": s})
+        cfgmod.save({"session": s}, maintain=True)
         log("SUCCESS",
             f"登录成功 token={str(detail.get('token'))[:12]}... accNo={acc}")
     else:
@@ -161,7 +164,9 @@ def persist_session(ad) -> None:
     cur = (ad.cfg.get("session") or {}).get("acc_no")
     if cur is not None:
         s["acc_no"] = cur
-    cfgmod.save({"session": s})
+    # maintain=True：程序自己在维护会话，不能触发「账号变更清会话」
+    s["account_hash"] = cfgmod.acct_hash({**cfgmod.load(), "session": s})
+    cfgmod.save({"session": s}, maintain=True)
 
 
 def do_list_rooms() -> Dict[str, Any]:
@@ -504,7 +509,28 @@ class Handler(BaseHTTPRequestHandler):
                 # 服务器地址归一化：用户可能只填 10.20.15.27，这里补上 http://
                 if isinstance(body, dict) and "base_url" in body:
                     body["base_url"] = adapters.normalize_base_url(body.get("base_url") or "")
+                # 时间字段归一化：中文输入法会打出全角冒号 "20：55"，
+                # 不转成半角的话后面 int() 会直接抛异常、整个下单失败。
+                if isinstance(body, dict):
+                    _t = body.get("target")
+                    if isinstance(_t, dict):
+                        for _k in ("start_time", "end_time"):
+                            if _t.get(_k) is not None:
+                                _t[_k] = adapters.normalize_hhmm(_t.get(_k))
+                    _s = body.get("schedule")
+                    if isinstance(_s, dict) and _s.get("fire_time") is not None:
+                        _s["fire_time"] = adapters.normalize_hhmm(_s.get("fire_time"))
+                before_cfg = cfgmod.load()
                 cfg = cfgmod.save(body)
+                # 若因账号变更清掉了旧会话，在界面日志里明确说出来，
+                # 免得用户疑惑「为什么改了账号还是旧的在约」。
+                _old_h = (before_cfg.get("session") or {}).get("account_hash") or ""
+                _new_h = (cfg.get("session") or {}).get("account_hash") or ""
+                if _old_h and _new_h and _old_h != _new_h:
+                    _old_u = (before_cfg.get("account") or {}).get("username") or "(空)"
+                    _new_u = (cfg.get("account") or {}).get("username") or "(空)"
+                    log("WARN", f"账号已变更（{_old_u} → {_new_u}），已清除旧登录状态，"
+                                f"请先点「登录检测」重新登录，再预约")
                 log("INFO", "配置已保存")
                 return self._json({"ok": True, "message": "配置已保存", "config": cfgmod.redact(cfg)})
             if path == "/api/reload":
@@ -520,8 +546,9 @@ class Handler(BaseHTTPRequestHandler):
             if path == "/api/trigger":
                 return self._json(scheduler.trigger_now())
             if path == "/api/verify":
-                # 「预约验证」：立即用当前预约参数下单，时段强制为下午(13:30-18:00)
-                return self._json(scheduler.trigger_now(slot_override="afternoon"))
+                # 「预约验证」：立即用界面上当前填选的预约时段下单。
+                # （以前这里强制用下午时段，用户改选别的时段后验证结果会误导。）
+                return self._json(scheduler.trigger_now())
             if path == "/api/test-delay":
                 # 「1分钟后测试」：delay_s 秒后走完整定时流程发送一次预约请求
                 delay = float(body.get("delay_s") or 60)

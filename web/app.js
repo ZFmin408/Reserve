@@ -5,13 +5,20 @@ const $ = (id) => document.getElementById(id);
 const SLOT_LABEL = { morning: "上午 08:00–12:00", afternoon: "下午 13:30–18:00", evening: "晚上 19:00–22:00" };
 const CUSTOM = "__custom__";
 
-/** 归一化用户手填的定时时间：支持 13:01 / 13:01:30 / 1301 / 9:5 等写法，返回 HH:MM:SS 或 "" */
+/** 归一化用户手填的时间：支持 13:01 / 1301 / 13:01:30 / 全角「13：01」等写法，返回 HH:MM:SS 或 "" */
 function normalizeTimeInput(raw) {
-  let s = (raw || "").trim().replace(/：/g, ":").replace(/\s+/g, "");
+  let s = (raw || "").trim().replace(/\s+/g, "");
+  // 全角 -> 半角：冒号 U+FF1A、数字 U+FF10~FF19（中文输入法很容易打出来）
+  s = s.replace(/\uFF1A/g, ":").replace(/\uFF0F/g, "/")
+       .replace(/[\uFF10-\uFF19]/g, (c) => String.fromCharCode(c.charCodeAt(0) - 0xFEE0));
   if (!s) return "";
   let m = s.match(/^(\d{1,2}):(\d{1,2})(?::(\d{1,2}))?$/);
   if (!m) {
-    m = s.match(/^(\d{1,2})(\d{2})(\d{2})?$/);   // 1301 / 130130
+    // 纯数字紧凑写法，按长度确定格式（不猜）：
+    //   3 位 HMM -> 9:30 / 4 位 HHMM -> 20:55 / 6 位 HHMMSS -> 20:55:30
+    if (/^\d{3}$/.test(s)) m = s.match(/^(\d)(\d{2})$/);
+    else if (/^\d{4}$/.test(s)) m = s.match(/^(\d{2})(\d{2})$/);
+    else if (/^\d{6}$/.test(s)) m = s.match(/^(\d{2})(\d{2})(\d{2})$/);
     if (!m) return "";
   }
   const h = parseInt(m[1], 10), mi = parseInt(m[2], 10), sec = m[3] ? parseInt(m[3], 10) : 0;

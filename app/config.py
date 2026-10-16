@@ -84,7 +84,7 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     "target": {
         "space_id": "",      # 房间 ID (roomIds)
         "seat_id": "",       # 座位 ID (devId)
-        "seat_name": "",     # 座位名，如 4F-A106
+        "seat_name": "",     # 座位名，如 1F-A001
         "reserve_date": "",  # YYYY-MM-DD，留空=预约当天
         # 时段预设：morning(08:00-12:00) / afternoon(13:30-18:00) / evening(19:00-22:00)
         "slot": "afternoon",
@@ -248,12 +248,86 @@ def reload() -> Dict[str, Any]:
     return load()
 
 
-def save(patch: Dict[str, Any]) -> Dict[str, Any]:
-    """合并式保存：patch 里出现的键覆盖，未出现的保留。"""
+def acct_hash(cfg: Dict[str, Any]) -> str:
+    """账号指纹：服务器地址 + 学号 + 密码。
+
+    用途：判断会话（token/accNo）是否还属于当前账号。
+    改账号后如果继续用旧 token，就会「以旧账号身份下单」——
+    accNo 是下单 payload 里的 appAccNo，直接决定约在谁名下。
+    """
+    import hashlib
+    acc = cfg.get("account") or {}
+    raw = str(cfg.get("base_url") or "").strip().rstrip("/")
+    # 补 http://，与 adapters.normalize_base_url 保持等价
+    if raw and "://" not in raw:
+        raw = "http://" + raw.lstrip("/")
+    key = f"{raw}|{acc.get('username')}|{acc.get('password')}"
+    return hashlib.md5(key.encode("utf-8")).hexdigest()
+
+
+def save(patch: Dict[str, Any], maintain: bool = False) -> Dict[str, Any]:
+    """合并式保存：patch 里出现的键覆盖，未出现的保留。
+
+    maintain=True 表示「程序内部维护会话」（保存 token/accNo），
+                 此时不做账号变更检测 —— 否则刚登录拿到的 token
+                 会被自己清掉。
+
+    maintain=False（默认，用户改配置）时额外做两件保护：
+      1) account 里没带的字段沿用旧值 —— 否则前端某条路径只传 username 时
+         会把已存的密码清掉。
+      2) 账号指纹（地址/学号/密码）变化时**清空 session 的 token 与 acc_no**，
+         否则会继续用上一个账号的 token 下单。
+    """
     global _cache, _cache_mtime
     with _lock:
         current = load()
-        merged = _deep_merge(current, patch or {})
+        patch = copy.deepcopy(patch or {})
+
+        if not maintain:
+            # 1) account 增量合并：没传的字段（尤其 password）保留旧值。
+            #    只认「键不存在」—— 显式传空串仍然会覆盖（用户可能真想清空）。
+            if isinstance(patch.get("account"), dict):
+                old_acc = current.get("account") or {}
+                for k, v in old_acc.items():
+                    if k not in patch["account"]:
+                        patch["account"][k] = v
+
+            # 2) 账号变了 -> 旧会话作废。
+            #    仅在**旧配置本来就有学号**时才判定为「换账号」。
+            #    否则全新安装（DEFAULT_CONFIG 里 username 是空串）的首次保存
+            #    会被误判成「账号已变更」，把刚存的 token 清掉。
+            if isinstance(patch.get("account"), dict) or "base_url" in patch:
+                old_u = ((current.get("account") or {}).get("username") or "").strip()
+                if old_u:
+                    try:
+                        before = acct_hash(current)
+                    except Exception:
+                        before = ""
+                    probe = _deep_merge(current, patch)
+                    try:
+                        after = acct_hash(probe)
+                    except Exception:
+                        after = before
+                    if before != after:
+                        new_u = (probe.get("account") or {}).get("username") or "(空)"
+                        # 清掉属于旧账号的凭证
+                        patch.setdefault("session", {})
+                        if isinstance(patch["session"], dict):
+                            patch["session"]["token"] = ""
+                            patch["session"]["acc_no"] = None
+                            patch["session"]["account_hash"] = ""
+                        try:
+                            import logging
+                            logging.getLogger("reserve").warning(
+                                "账号已变更（%s -> %s），已清除旧登录状态", old_u, new_u)
+                        except Exception:
+                            pass
+
+        merged = _deep_merge(current, patch)
+        merged["session"] = merged.get("session") or {}
+        if isinstance(merged["session"], dict):
+            merged["session"]["account_hash"] = acct_hash(merged)
+
         os.makedirs(os.path.dirname(CONFIG_PATH), exist_ok=True)
         tmp = CONFIG_PATH + ".tmp"
         with open(tmp, "w", encoding="utf-8") as f:

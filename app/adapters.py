@@ -55,16 +55,82 @@ def resolve_slot_time(target: Dict[str, Any], slot_override: str = "") -> Tuple[
       - 选预设：target.slot = "morning"/"afternoon"/"evening"
       - 选自定义：target.slot = ""（或前端标记 "__custom__"），
                   同时用 target.start_time / target.end_time 手填 HH:MM
-    slot_override 用于「预约验证」按钮强制指定时段（如 "afternoon"）。
+    slot_override 是内部参数：传了就强制用该预设，忽略 target.slot。
+    目前没有调用方会传（「预约验证」也用界面当前填选的时段），
+    保留它只是为了让单测和将来的「强制时段」用法有入口。
     """
     slot = (slot_override or target.get("slot") or "").strip().lower()
     if slot in TIME_SLOTS:
         s = TIME_SLOTS[slot]
         return s["start"], s["end"], slot
-    # 自定义（或旧配置）：用手填的起止时间
-    return (str(target.get("start_time") or "").strip(),
-            str(target.get("end_time") or "").strip(),
+    # 自定义（或旧配置）：用手填的起止时间。
+    # 必须归一化：中文输入法可能打出全角冒号 "20：55"。
+    return (normalize_hhmm(target.get("start_time")),
+            normalize_hhmm(target.get("end_time")),
             "")
+
+
+def to_ascii_digits(s: str) -> str:
+    """把全角字符转成半角。
+
+    中文输入法下很容易打出全角冒号（U+FF1A「：」）和全角数字（Ｕ+FF10~FF19），
+    例如 "20：55"。这在字节层面是完全不同的字符，int() 会直接抛
+    ValueError: invalid literal for int() with base 10。
+    """
+    if not s:
+        return ""
+    table = {ord("："): ":", ord("．"): ".", ord("－"): "-",
+             ord("　"): " ", ord("／"): "/"}
+    for i in range(10):                      # 全角数字 ０-９ -> 0-9
+        table[0xFF10 + i] = chr(0x30 + i)
+    return str(s).translate(table)
+
+
+def normalize_hhmm(value: Any) -> str:
+    """把用户填的时间归一化成 "HH:MM:SS"。
+
+    支持：20:55 / 20：55（全角冒号）/ 20:55:30 / 2055 / 205530 / 9:5
+    处理不了就原样返回，由调用方决定怎么办 —— 但绝不会是「能过 isdigit
+    却过不了 int()」的状态。
+    """
+    s = to_ascii_digits(str(value or "")).strip()
+    if not s:
+        return ""
+    # 带冒号的写法
+    m = re.match(r"^(\d{1,2}):(\d{1,2})(?::(\d{1,2}))?$", s)
+    if not m:
+        # 纯数字紧凑写法，按长度确定格式（不猜）：
+        #   3 位 HMM   -> 9:30
+        #   4 位 HHMM  -> 20:55
+        #   6 位 HHMMSS-> 20:55:30
+        if re.match(r"^\d{3}$", s):
+            m = re.match(r"^(\d)(\d{2})$", s)
+        elif re.match(r"^\d{4}$", s):
+            m = re.match(r"^(\d{2})(\d{2})$", s)
+        elif re.match(r"^\d{6}$", s):
+            m = re.match(r"^(\d{2})(\d{2})(\d{2})$", s)
+    if not m:
+        return s                            # 认不出来就原样返回
+    h, mi = int(m.group(1)), int(m.group(2))
+    # 3/4 位写法没有秒的捕获组，用 groups() 长度判断，别直接 group(3)
+    g3 = m.group(3) if len(m.groups()) >= 3 else None
+    sec = int(g3) if g3 else 0
+    if h > 23 or mi > 59 or sec > 59:
+        return s
+    return f"{h:02d}:{mi:02d}:{sec:02d}"
+
+
+def parse_hhmm(value: Any) -> Optional[Tuple[int, int]]:
+    """拿到 (时, 分)。用于算时长，绝不抛异常；非法值返回 None。"""
+    s = normalize_hhmm(value)
+    m = re.match(r"^(\d{1,2}):(\d{2})", s)
+    if not m:
+        return None
+    h, mi = int(m.group(1)), int(m.group(2))
+    # 越界值（24:00 / 20:70）不能拿去算时长，否则会得出荒唐结果
+    if not (0 <= h <= 23 and 0 <= mi <= 59):
+        return None
+    return h, mi
 
 
 def split_items(s: Any) -> List[str]:
@@ -246,10 +312,9 @@ class BaseAdapter:
     _session_cache: Optional[Dict[str, Any]] = None   # {"hash":..., "at": ts, "detail": {...}}
 
     def _acct_hash(self) -> str:
-        import hashlib as _h
-        acc = self.cfg.get("account") or {}
-        key = f"{self.base_url}|{acc.get('username')}|{acc.get('password')}"
-        return _h.md5(key.encode("utf-8")).hexdigest()
+        """账号指纹。与 config.acct_hash 保持一致，避免两处算不一样。"""
+        from app.config import acct_hash as _ah
+        return _ah(self.cfg)
 
     def has_session(self) -> bool:
         return bool(self.client.extra_headers.get("token"))
@@ -268,14 +333,48 @@ class BaseAdapter:
         h = self._acct_hash()
 
         if not force:
+            def _usable(t: str) -> bool:
+                """token 得像个真 token —— 真实值是 32 位十六进制。
+                测试残留的 "T"、"TOKEN-TEST" 这种假值必须当成无效，
+                否则会被当成「已登录」拿去打接口，一路 300 未登录。"""
+                t = (t or "").strip()
+                return len(t) >= 16
+
+            # 内存缓存的会话是否可信：必须同时满足
+            #   a) 指纹一致、未过期
+            #   b) 配置里存的 token 也属于当前账号（或本来就为空）
+            # 否则会出现「配置的 token 已因换账号被清空，但内存缓存还在用旧账号」
+            # 这种串号情况。
+            saved_tok = ((self.cfg.get("session") or {}).get("token") or "").strip()
+            saved_hash = (self.cfg.get("session") or {}).get("account_hash") or ""
+            cfg_tok_ok = (not saved_tok) or (saved_hash == h)
+
             c = type(self)._session_cache
-            if c and c.get("hash") == h and (time.time() - c["at"]) < ttl:
+            if (cfg_tok_ok and c and c.get("hash") == h and (time.time() - c["at"]) < ttl):
                 tok = (c["detail"] or {}).get("token")
-                if tok:
+                if _usable(tok):
                     self.client.extra_headers["token"] = tok
                     self.log("INFO", "复用已登录会话（未重复调用登录接口）")
                     return True, "复用已登录会话", c["detail"]
-            st = (self.cfg.get("session") or {}).get("token")
+            if not cfg_tok_ok:
+                self.log("WARN", "配置里的 token 不属于当前账号，忽略内存缓存，重新登录")
+                type(self)._session_cache = None
+
+            st = saved_tok
+            if st and not _usable(st):
+                self.log("WARN", f"配置里的 token 不像有效值（{st[:16]!r}），忽略并重新登录")
+                st = ""
+            if st:
+                # ★ 关键：token 必须属于**当前账号**才能复用。
+                #   否则改了学号/密码后，会继续拿旧账号的 token 下单
+                #   （accNo 也是旧的 -> 约在别人名下）。
+                if saved_hash and saved_hash != h:
+                    self.log("WARN", "账号已变更，丢弃 config.json 里的旧 token，重新登录")
+                    st = ""
+                elif not saved_hash:
+                    # 旧版本配置没存过指纹：无从判断，宁可重登一次也不要串号
+                    self.log("INFO", "配置里没有账号指纹，重新登录以确保会话属于当前账号")
+                    st = ""
             if st:
                 self.client.extra_headers["token"] = st
                 self.log("INFO", "复用 config.json 里保存的 token（未重复登录）")
@@ -643,8 +742,8 @@ class IcAdapter(ReplayMixin, BaseAdapter):
         """GET /ic-web/reserve?roomIds=<roomId>&resvDates=YYYYMMDD&sysKind=8
 
         实测响应里每个座位形如：
-        {"devId":100493961,"devName":"2F-B001","devStatus":0,"devProp":2,
-         "coordinate":"67.75,26.54","kindName":"二楼座位","roomName":"二楼B区",
+        {"devId":100000001,"devName":"1F-A001","devStatus":0,"devProp":2,
+         "coordinate":"67.75,26.54","kindName":"一楼座位","roomName":"一楼A区",
          "openStart":"08:00","openEnd":"22:00","resvInfo":[...]}
         devId 就是下单 payload 里 resvDevEncrypts 要加密的那个 ID。
         """
@@ -826,7 +925,7 @@ class IcAdapter(ReplayMixin, BaseAdapter):
         """构造 POST /ic-web/reserve/seat 的请求体。
 
         实测（2026-10 抓包）真实结构：
-        {"sysKind":8,"appAccNo":100510484,"memberKind":1,"resvMember":[100510484],
+        {"sysKind":8,"appAccNo":<accNo>,"memberKind":1,"resvMember":[<accNo>],
          "resvBeginTime":"2026-10-16 14:00:00","resvEndTime":"2026-10-16 18:00:00",
          "testName":"","captcha":"","resvProperty":0,"resvDev":[0],
          "encryptVlaue":"<RSA(随机口令) base64>",
@@ -859,18 +958,17 @@ class IcAdapter(ReplayMixin, BaseAdapter):
         rule = self.fetch_seat_rule(dev_id, day)
         mn, mx = int(rule.get("minResvTime") or 0), int(rule.get("maxResvTime") or 0)
         if mn or mx:
-            try:
-                sh, sm = [int(x) for x in start.split(":")[:2]]
-                eh, em = [int(x) for x in end.split(":")[:2]]
-                dur = (eh * 60 + em) - (sh * 60 + sm)
-                if mn and dur < mn:
+            # 用 parse_hhmm 而不是 int(x) —— 用户可能填了全角冒号 "20：55"，
+            # 直接 int() 会抛 ValueError 并让整个下单失败。
+            ps, pe = parse_hhmm(start), parse_hhmm(end)
+            if ps and pe:
+                dur = (pe[0] * 60 + pe[1]) - (ps[0] * 60 + ps[1])
+                if mn and 0 < dur < mn:
                     raise ValueError(f"预约时长 {dur} 分钟 < 规则要求最短 {mn} 分钟，请改时段。")
                 if mx and dur > mx:
                     raise ValueError(f"预约时长 {dur} 分钟 > 规则允许最长 {mx} 分钟，请改时段。")
-            except ValueError:
-                raise
-            except Exception:
-                pass
+                if dur <= 0:
+                    raise ValueError(f"结束时间必须晚于开始时间，当前 {start} → {end}。")
 
         def stamp(hhmm: str) -> str:
             s = hhmm if hhmm.count(":") >= 2 else f"{hhmm}:00"
@@ -929,10 +1027,19 @@ class IcAdapter(ReplayMixin, BaseAdapter):
           4. 配置里手工填的 account.acc_no
         都没有就返回 None，由调用方决定是否先登录。
         """
-        # 1) 登录时缓存（llogin 成功就会写）
+        # 1) 登录时缓存（llogin 成功就会写）。
+        #    ★ 必须确认这个 accNo 属于**当前账号** —— 它是下单 payload 的
+        #      appAccNo/resvMember，直接决定约在谁名下。
+        #      换账号后如果还沿用旧 acc_no，就会出现「用旧账号预约」。
         sess = self.cfg.get("session") or {}
         if sess.get("acc_no") is not None:
-            return sess["acc_no"]
+            saved = sess.get("account_hash") or ""
+            if saved and saved == self._acct_hash():
+                return sess["acc_no"]
+            if saved:
+                self.log("WARN", "配置里的 accNo 属于其它账号，已忽略（将重新登录）")
+            else:
+                self.log("INFO", "配置里没有账号指纹，无法确认 accNo 归属，将重新登录")
         # 2) 旧的内存缓存
         lids = self.cfg.get("_login_cache") or {}
         if lids.get("user_id") is not None:
@@ -1001,8 +1108,8 @@ class IcAdapter(ReplayMixin, BaseAdapter):
             info["resvDate"] = data.get("resvDate")
             info["resvStatus"] = data.get("resvStatus")
             # ★ 成功响应里的 resvDevInfoList 才是座位信息的权威来源
-            #   实测：{"devId":100495157,"devName":"4F-A106","roomId":100494721,
-            #          "roomName":"四楼A区","kindName":"四楼座位"}
+            #   实测：{"devId":100000002,"devName":"1F-A002","roomId":100000010,
+            #          "roomName":"一楼A区","kindName":"一楼座位"}
             devs = data.get("resvDevInfoList") or []
             d0 = (devs[0] or {}) if isinstance(devs, list) and devs else {}
             if d0.get("devId"):
