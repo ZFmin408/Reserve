@@ -38,9 +38,15 @@
   },
   "paths": {
     "login": "/ic-web/login/user",
+    "public_key": "/ic-web/login/publicKey",
+    "booking": "/ic-web/reserve/seat",
+    "room_list": "/ic-web/room/getAll",
+    "seat_list": "/ic-web/reserve",
+    "room_open": "/ic-web/seatRoom/openScope",
+    "seat_map": "/ic-web/seatDevice/coordinate",
+    "account_info": "/ic-web/account/info",
     "seat_free": "/ic-web/seat/freeSeat",
     "space_list": "/ic-web/space/list",
-    "booking": "/ic-web/seat/booking",
     "booking_check": "/ic-web/seat/booking/check",
     "user_info": "/ic-web/user/info"
   },

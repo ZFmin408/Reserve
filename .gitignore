@@ -12,6 +12,11 @@ __pycache__/
 *.py[cod]
 .pytest_cache/
 
+# ---- PyInstaller build output (18MB, 用 tools/build_exe.py 本地重建) ----
+build/
+dist/
+*.manifest
+
 # ---- local environment ----
 .venv/
 venv/

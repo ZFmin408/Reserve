@@ -240,6 +240,47 @@ def main() -> int:
     check("booking.aes_padding 默认 zero", cfg["booking"]["aes_padding"] == "zero")
     check("booking.aes_iv 与 JS 一致", cfg["booking"]["aes_iv"] == "ABCDEF1234123412")
     check("booking.sys_kind 默认 8", cfg["booking"]["sys_kind"] == 8)
+
+    # ★ 端点防回归：写错就是 404，历史上真踩过（config.json 丢失后回退到错值）
+    # 真实场景：全新安装时 config.json 不存在 -> cfgmod.load() 合并 DEFAULT_CONFIG
+    import tempfile as _tf
+    from app import config as _cfgmod
+    from app.adapters import IcAdapter as _IA
+    _old_path = _cfgmod.CONFIG_PATH
+    try:
+        _cfgmod.CONFIG_PATH = os.path.join(_tf.mkdtemp(prefix="ep-test-"), "config.json")
+        _cfgmod.reload()                      # 从"不存在的配置文件"加载 -> 纯默认值
+        _fresh = _cfgmod.load()
+        _ad = _IA(_fresh, None, lambda *a, **k: None)
+        expect_paths = {
+            "login": "/ic-web/login/user",
+            "public_key": "/ic-web/login/publicKey",
+            "booking": "/ic-web/reserve/seat",
+            "seat_list": "/ic-web/reserve",
+            "room_list": "/ic-web/room/getAll",
+            "room_open": "/ic-web/seatRoom/openScope",
+            "account_info": "/ic-web/account/info",
+        }
+        for key, want in expect_paths.items():
+            got = _ad.path(key, "")
+            check(f"全新安装时 {key} 端点正确", got == want, f"得到 {got!r} 期望 {want!r}")
+    finally:
+        _cfgmod.CONFIG_PATH = _old_path
+        _cfgmod.reload()
+
+    _dp = cfgmod.DEFAULT_CONFIG.get("paths", {})
+    check("DEFAULT_CONFIG.booking 正确", _dp.get("booking") == "/ic-web/reserve/seat",
+          str(_dp.get("booking")))
+    check("DEFAULT_CONFIG.seat_list 正确", _dp.get("seat_list") == "/ic-web/reserve",
+          str(_dp.get("seat_list")))
+    check("DEFAULT_CONFIG 不再含旧错误端点",
+          _dp.get("booking") != "/ic-web/seat/booking")
+
+    # ★ accNo 必须能持久化。历史 bug：只存在 _login_cache（仅预热时写），
+    #   预热默认关闭后「立即执行」就拿不到 accNo。
+    check("session 默认含 acc_no 字段", "acc_no" in cfgmod.DEFAULT_CONFIG["session"])
+    check("session 默认 acc_no 为 None", cfgmod.DEFAULT_CONFIG["session"]["acc_no"] is None)
+
     r = cfgmod.redact({**cfg, "account": {"username": "u", "password": "secret"}})
     check("脱敏隐藏密码", r["account"]["password"] == "********")
 

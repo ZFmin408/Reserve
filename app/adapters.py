@@ -51,13 +51,17 @@ def resolve_date(s: str) -> str:
 def resolve_slot_time(target: Dict[str, Any], slot_override: str = "") -> Tuple[str, str, str]:
     """把「时段预设」解析成 (start, end, slot_key)。
 
-    前端只让用户选 上午/下午/晚上；后端把预设映射成具体 HH:MM。
-    若 target.slot 为空，则回退到手填的 start_time / end_time（兼容旧配置）。
+    前端可以：
+      - 选预设：target.slot = "morning"/"afternoon"/"evening"
+      - 选自定义：target.slot = ""（或前端标记 "__custom__"），
+                  同时用 target.start_time / target.end_time 手填 HH:MM
+    slot_override 用于「预约验证」按钮强制指定时段（如 "afternoon"）。
     """
     slot = (slot_override or target.get("slot") or "").strip().lower()
     if slot in TIME_SLOTS:
         s = TIME_SLOTS[slot]
         return s["start"], s["end"], slot
+    # 自定义（或旧配置）：用手填的起止时间
     return (str(target.get("start_time") or "").strip(),
             str(target.get("end_time") or "").strip(),
             "")
@@ -95,6 +99,76 @@ def find_first(obj: Any, names: List[str]) -> Any:
     return None
 
 
+def classify_failure(resp) -> Tuple[str, str]:
+    """把下单失败分类，决定「要不要继续重试」。
+
+    返回 (kind, message)，kind 取值：
+      "success"   —— 成功
+      "transient" —— 暂时性，等一会儿重试可能成功（时间窗口没到、被别人抢先）
+      "permanent" —— 确定性失败，重试无意义（没登录、座位不存在、参数错）
+
+    实测错误码：
+      code 0   成功
+      code 1   「不在提前预约时间范围内」/「该时段已被预约」→ 可重试
+      code 100 请求参数错误 → 重试无用
+      code 300 用户未登录   → 重试无用（要先重新登录）
+    """
+    t = resp.text or ""
+    if resp.status == 0:
+        return "permanent", f"网络错误: {t[:120]}"
+    if resp.status == 404:
+        return "permanent", "接口不存在(404)：请检查 paths.booking 配置"
+    if resp.status >= 400:
+        return "permanent", f"HTTP {resp.status}: {t[:120]}"
+
+    # 只取 message 字段判断，避免 JSON 里的字段名（如 "code"）撞关键词
+    j = resp.json() if callable(getattr(resp, "json", None)) else None
+    message = ""
+    if isinstance(j, dict):
+        message = str(j.get("message") or j.get("msg") or "")
+    if not message:
+        message = t[:200]
+    code = j.get("code") if isinstance(j, dict) else None
+
+    # 可用错误码直接判定，最可靠
+    if code in (100, 300):
+        return "permanent", message
+    if code == 1:
+        # code=1 既可能是「时间窗口没到」也可能是「参数错」，看文字
+        for kw in ("不在提前预约时间范围", "时间范围", "已被预约", "已被占用",
+                   "请求频繁", "稍后重试"):
+            if kw in message:
+                return "transient", message
+        for kw in ("参数", "不存在", "未登录", "权限"):
+            if kw in message:
+                return "permanent", message
+        return "transient", message
+
+    # code 为其它值或缺失：按文字判断
+    for kw in ("不在提前预约时间范围", "已被预约", "已被占用", "请求频繁", "稍后重试"):
+        if kw in message:
+            return "transient", message
+    for kw in ("用户未登录", "请重新登录", "参数错误", "不存在", "无权限", "权限不足"):
+        if kw in message:
+            return "permanent", message
+    return "transient", message       # 未知错误按可重试处理
+
+
+def parse_window_wait(text: str) -> float:
+    """从「不在提前预约时间范围内」的响应里估算还要等多少秒。
+
+    服务器只给文字（"earlyInTime": 30 是另一回事），所以从 message 里尽量提取；
+    提取不到就返回 0，由调用方用固定间隔重试。
+    """
+    m = re.search(r"(\d+)\s*分钟", text or "")
+    if m:
+        return float(m.group(1)) * 60
+    m = re.search(r"(\d+(?:\.\d+)?)\s*秒", text or "")
+    if m:
+        return float(m.group(1))
+    return 0.0
+
+
 def _fmt(url: str, method: str, body: str) -> str:
     return f"{method} {url}\n{body[:1200]}"
 
@@ -115,6 +189,28 @@ def _looks_like_param_error(resp) -> bool:
             or "请求参数错误" in t)
 
 
+def normalize_base_url(raw: str) -> str:
+    """把用户填的服务器地址归一化成可用的 URL。
+
+    用户常见的填法：
+        10.20.15.27                  -> http://10.20.15.27
+        10.20.15.27/ic-web           -> http://10.20.15.27/ic-web   （保留路径）
+        http://10.20.15.27/          -> http://10.20.15.27         （去掉末尾斜杠）
+        10.20.15.27:8080             -> http://10.20.15.27:8080
+        https://lib.example.com      -> 原样保留协议
+    没写协议时默认补 http://（校内系统基本都是 http）。
+    """
+    s = (raw or "").strip()
+    if not s:
+        return ""
+    # 已经带了协议就只做去尾斜杠
+    if re.match(r"^https?://", s, re.I):
+        return s.rstrip("/")
+    # 补 http://
+    s = "http://" + s.lstrip("/")
+    return s.rstrip("/")
+
+
 # ----------------------------- 基类 -----------------------------
 class BaseAdapter:
     name = "base"
@@ -127,7 +223,7 @@ class BaseAdapter:
     # --- config 便捷访问
     @property
     def base_url(self) -> str:
-        return (self.cfg.get("base_url") or "").rstrip("/")
+        return normalize_base_url(self.cfg.get("base_url") or "")
 
     def path(self, key: str, fallback: str) -> str:
         return (self.cfg.get("paths") or {}).get(key) or fallback
@@ -491,6 +587,10 @@ class IcAdapter(ReplayMixin, BaseAdapter):
             sess["token"] = str(token)
         if self.client.cookies:
             sess["cookie"] = self.client.cookie_header()
+        # ★ accNo 必须缓存下来：下单 payload 的 appAccNo/resvMember 需要它。
+        #   以前只存在 _login_cache（仅预热时设置），预热默认关闭后就拿不到了。
+        if uid is not None:
+            sess["acc_no"] = uid
         self.log("SUCCESS",
                  f"登录成功 token={str(token)[:12] if token else '(响应里无 token)'} accNo={uid}")
         return True, "登录成功", {"token": str(token) if token else "", "user_id": uid, "lib_id": lib,
@@ -678,6 +778,44 @@ class IcAdapter(ReplayMixin, BaseAdapter):
                 return True, f"取消成功 ({p})", {"attempts": attempts, "response": j}
         return False, "取消失败，三种端点都被拒", {"attempts": attempts}
 
+    # ---------- 座位规则（提前预约限制等） ----------
+    def fetch_seat_rule(self, dev_id: Any, day: str = "") -> Dict[str, Any]:
+        """查某个座位的预约规则（earliestResvTime / minResvTime / maxResvTime ...）。
+
+        实测：四楼A区 resvRule 里 earliestResvTime=360（只能提前 6 小时预约），
+        不满足会被服务器拒为「不在提前预约时间范围内」。
+        """
+        t = self.cfg.get("target") or {}
+        room = str(t.get("space_id") or "").strip()
+        if not room or dev_id in (None, ""):
+            return {}
+        day = resolve_date(day or t.get("reserve_date", ""))
+        compact = day.replace("-", "").replace("/", "")
+        try:
+            url = self.url(self.path("seat_list", "/ic-web/reserve")) + "?" + urlencode(
+                {"roomIds": room, "resvDates": compact,
+                 "sysKind": int((self.cfg.get("booking") or {}).get("sys_kind") or 8)})
+            r = self.client.get(url)
+            rows = unwrap(r.json() or {}) or []
+            for row in rows if isinstance(rows, list) else []:
+                if str(row.get("devId")) == str(dev_id):
+                    rule = row.get("resvRule") or {}
+                    return {
+                        "ruleId": rule.get("ruleId"),
+                        "ruleName": rule.get("ruleName"),
+                        "earliestResvTime": rule.get("earliestResvTime") or 0,
+                        "minResvTime": rule.get("minResvTime") or 0,
+                        "maxResvTime": rule.get("maxResvTime") or 300,
+                        "timeInterval": rule.get("timeInterval") or 10,
+                        "openStart": row.get("openStart"),
+                        "openEnd": row.get("openEnd"),
+                        "devName": row.get("devName"),
+                        "roomName": row.get("roomName"),
+                    }
+        except Exception as e:
+            self.log("WARN", f"查座位规则失败: {e!r}")
+        return {}
+
     # ---------- 预约（按实测 cURL 还原的真实 payload） ----------
     def _build_booking_payload(self, acc_no: Any, slot_override: str = "") -> Tuple[Dict[str, Any], str]:
         """构造 POST /ic-web/reserve/seat 的请求体。
@@ -705,6 +843,29 @@ class IcAdapter(ReplayMixin, BaseAdapter):
         start, end, slot_key = resolve_slot_time(t, slot_override)
         if not start or not end:
             raise ValueError("未选择时段。请在界面上选择 上午 / 下午 / 晚上。")
+
+        # 说明：这里**不做**「提前预约时间范围」的本地拦截。
+        # 原因：那是服务器的判断，本地时钟/秒级取整都可能让它误判，
+        #       结果把本来能成功的预约拦掉。现在改为直接发给服务器：
+        #       服务器若回「不在提前预约时间范围内」，会被分类为可重试，
+        #       调度器每 2 秒重试一次，进入可约范围后立刻成功。
+        # 只保留「时长」校验：那是确定性错误（改时段才可能成功），
+        # 本地拦掉可以省一次无效请求。
+        rule = self.fetch_seat_rule(dev_id, day)
+        mn, mx = int(rule.get("minResvTime") or 0), int(rule.get("maxResvTime") or 0)
+        if mn or mx:
+            try:
+                sh, sm = [int(x) for x in start.split(":")[:2]]
+                eh, em = [int(x) for x in end.split(":")[:2]]
+                dur = (eh * 60 + em) - (sh * 60 + sm)
+                if mn and dur < mn:
+                    raise ValueError(f"预约时长 {dur} 分钟 < 规则要求最短 {mn} 分钟，请改时段。")
+                if mx and dur > mx:
+                    raise ValueError(f"预约时长 {dur} 分钟 > 规则允许最长 {mx} 分钟，请改时段。")
+            except ValueError:
+                raise
+            except Exception:
+                pass
 
         def stamp(hhmm: str) -> str:
             s = hhmm if hhmm.count(":") >= 2 else f"{hhmm}:00"
@@ -754,38 +915,58 @@ class IcAdapter(ReplayMixin, BaseAdapter):
         return payload, explain
 
     def _current_acc_no(self) -> Any:
-        """拿当前账号的 accNo（下单 payload 的 appAccNo / resvMember）。"""
-        # 先看登录缓存
+        """拿当前账号的 accNo（下单 payload 的 appAccNo / resvMember 需要）。
+
+        查找顺序（从快到慢、从可靠到兜底）：
+          1. 登录时缓存进 session.acc_no（正常路径）
+          2. 进程内 _login_cache（兼容旧逻辑）
+          3. 直接打 /ic-web/account/info（有些系统返回明文）
+          4. 配置里手工填的 account.acc_no
+        都没有就返回 None，由调用方决定是否先登录。
+        """
+        # 1) 登录时缓存（llogin 成功就会写）
+        sess = self.cfg.get("session") or {}
+        if sess.get("acc_no") is not None:
+            return sess["acc_no"]
+        # 2) 旧的内存缓存
         lids = self.cfg.get("_login_cache") or {}
         if lids.get("user_id") is not None:
             return lids["user_id"]
-        # 再问服务端
+        # 3) 问服务端
         try:
             r = self.client.get(self.url(self.path("account_info", "/ic-web/account/info")))
             data = unwrap(r.json() or {}) or {}
-            if data.get("accNo") is not None:
+            if isinstance(data, dict) and data.get("accNo") is not None:
                 return data["accNo"]
         except Exception:
             pass
-        # 兜底：从配置里读
-        return self.cfg.get("account", {}).get("acc_no") or None
+        # 4) 配置里手工填的
+        return (self.cfg.get("account") or {}).get("acc_no") or None
 
     def reserve(self, slot_override: str = "") -> Tuple[bool, str, dict]:
         rep = self.cfg.get("replay") or {}
         if rep.get("enabled") and rep.get("body"):
             return self._reserve_replay()
 
+        # ★ 关键：没有 session 就先把 accNo 准备好。
+        #   这里不能依赖 _login_cache（那只在预热里设置，而预热默认关闭）。
         acc_no = self._current_acc_no()
         if acc_no is None:
-            return False, "拿不到 accNo（appAccNo/resvMember 需要它）。请先成功登录一次。", \
-                   {"fatal": True}
+            self.log("INFO", "尚未获取 accNo，先执行一次登录")
+            ok, msg, detail = self.login()
+            if ok:
+                acc_no = self._current_acc_no() or detail.get("accNo") or detail.get("user_id")
+            if acc_no is None:
+                return False, (
+                    "拿不到 accNo（appAccNo/resvMember 需要它）。"
+                    "请先点「登录检测」确认账号密码正确，再重试。"
+                ), {"fatal": True}
 
         try:
             payload, explain = self._build_booking_payload(acc_no, slot_override)
         except Exception as e:
-            # 构造失败是确定性错误（缺 devId / 公钥解析不了 / 账号信息缺失），
+            # 构造失败是确定性的（缺 devId / 公钥解析不了 / 时长不合规），
             # 重试永远不会成功 —— 标记 fatal，让调度器立刻放弃，别白打接口。
-            # （实测：不标记的话会按 retry 一直打 100 多次）
             return False, f"构造下单请求失败，不会重试: {e}", {"fatal": True}
 
         url = self.url(self.path("booking", "/ic-web/reserve/seat"))
@@ -798,6 +979,16 @@ class IcAdapter(ReplayMixin, BaseAdapter):
         # 成功响应里带 resvId/uuid，提取出来方便取消
         info: Dict[str, Any] = {"status": resp.status, "body": resp.brief(), "sent": body,
                                 "explain": explain}
+        if not ok:
+            # ★ 分类失败原因，交给调度器决定是否继续重试
+            #   transient（时间窗口没到 / 被抢先）-> 继续重试
+            #   permanent（未登录 / 参数错 / 座位不存在）-> 立刻放弃
+            kind, reason = classify_failure(resp)
+            info["kind"] = kind
+            info["fatal"] = (kind == "permanent")
+            if kind == "transient":
+                info["retry_after_s"] = parse_window_wait(resp.text)
+            msg = reason
         data = unwrap(j) if ok else None
         if isinstance(data, dict):
             info["resvId"] = data.get("resvId")
@@ -823,12 +1014,13 @@ class IcAdapter(ReplayMixin, BaseAdapter):
             else:
                 msg = f"{msg}  resvId={data.get('resvId')} uuid={str(data.get('uuid'))[:8]}"
         self.log("SUCCESS" if ok else "WARN",
-                 f"预约 -> POST {url}\n{body}\n=> HTTP {resp.status} {resp.brief(400)}\n  {explain}")
+                 f"预约 -> POST {url}\n{body}\n=> HTTP {resp.status} {resp.brief(400)}\n  {explain}"
+                 + ("" if ok else f"\n  分类={info.get('kind')} fatal={info.get('fatal')}"))
         return ok, msg, info
 
     def _reserve_replay(self) -> Tuple[bool, str, dict]:
         rep = self.cfg["replay"]
-        path = rep.get("path") or self.path("booking", "/ic-web/seat/booking")
+        path = rep.get("path") or self.path("booking", "/ic-web/reserve/seat")
         url = self.url(self.render(path))
         body = self.render(rep.get("body") or "")
         headers = {k: self.render(v) for k, v in (rep.get("headers") or {}).items()}

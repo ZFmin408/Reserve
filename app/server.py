@@ -29,9 +29,48 @@ else:
     from .scheduler import Scheduler
 
 ROOT = cfgmod.ROOT
-WEB_DIR = os.path.join(ROOT, "web")
+
+
+def resource_dir(name: str = "") -> str:
+    """只读资源目录（web/）。
+
+    PyInstaller 打包后资源被解压到 sys._MEIPASS；开发环境就是项目目录。
+    """
+    base = getattr(sys, "_MEIPASS", None) or ROOT
+    return os.path.join(base, name) if name else base
+
+
+WEB_DIR = resource_dir("web")
+
 HOST = os.environ.get("RESERVE_HOST", "127.0.0.1")
-PORT = int(os.environ.get("RESERVE_PORT", "8765"))
+DEFAULT_PORT = int(os.environ.get("RESERVE_PORT", "8765"))
+
+
+def bind_server(preferred: int = DEFAULT_PORT, tries: int = 50) -> ThreadingHTTPServer:
+    """绑定端口，被占用就自动往后找一个空闲的。
+
+    优先尝试 preferred（默认 8765 / 环境变量 RESERVE_PORT），
+    依次试 preferred+1 ... preferred+tries；都失败则让系统随机分配。
+    """
+    last_err: Exception | None = None
+    for port in range(preferred, preferred + tries):
+        try:
+            srv = ThreadingHTTPServer((HOST, port), Handler)
+            srv.daemon_threads = True
+            if port != preferred:
+                print(f"[提示] 端口 {preferred} 已被占用，改用 {port}")
+            return srv
+        except OSError as e:            # 端口占用 / 权限不足
+            last_err = e
+            continue
+    try:
+        srv = ThreadingHTTPServer((HOST, 0), Handler)   # 0 = 让系统分配
+        srv.daemon_threads = True
+        print(f"[提示] 连续 {tries} 个端口都不可用，已让系统自动分配端口")
+        return srv
+    except OSError:
+        raise RuntimeError(f"无法绑定任何端口（起始 {preferred}）: {last_err}")
+
 
 # ----------------------------- 日志 -----------------------------
 _logs = deque(maxlen=800)
@@ -72,13 +111,18 @@ def do_login() -> Dict[str, Any]:
     ad.apply_session()
     ok, msg, detail = ad.login()
     if ok:
-        s = cfg.setdefault("session", {})
+        s = dict(cfg.get("session") or {})     # 保留已有字段（尤其 acc_no），只覆盖下面几项
         if client.extra_headers.get("token"):
             s["token"] = client.extra_headers["token"]
         if client.cookies:
             s["cookie"] = client.cookie_header()
+        # accNo 用于下单 payload 的 appAccNo/resvMember，必须持久化
+        acc = detail.get("accNo") or detail.get("user_id")
+        if acc is not None:
+            s["acc_no"] = acc
         cfgmod.save({"session": s})
-        log("SUCCESS", f"登录成功 token={str(detail.get('token'))[:12]}... user_id={detail.get('user_id')}")
+        log("SUCCESS",
+            f"登录成功 token={str(detail.get('token'))[:12]}... accNo={acc}")
     else:
         log("WARN", f"登录失败: {msg}")
     return {"ok": ok, "message": msg, "detail": {k: v for k, v in detail.items() if k != "raw"},
@@ -99,11 +143,25 @@ def do_list_seats(day: str) -> Dict[str, Any]:
 
 
 def persist_session(ad) -> None:
-    """把刷新后的 token/cookie 落盘，避免下次又用旧 token。"""
+    """把刷新后的 token/cookie 落盘，避免下次又用旧 token。
+
+    注意：必须**保留 session 里的其它字段**（尤其 acc_no），
+    否则会被「只写 token/cookie」覆盖掉，导致下单时拿不到 accNo。
+    """
     tok = ad.client.extra_headers.get("token")
     ck = ad.client.cookie_header()
-    if tok or ck:
-        cfgmod.save({"session": {"token": tok or "", "cookie": ck or ""}})
+    if not (tok or ck):
+        return
+    s = dict((cfgmod.load().get("session") or {}))
+    if tok:
+        s["token"] = tok
+    if ck:
+        s["cookie"] = ck
+    # 适配器可能在本次会话里拿到了 accNo
+    cur = (ad.cfg.get("session") or {}).get("acc_no")
+    if cur is not None:
+        s["acc_no"] = cur
+    cfgmod.save({"session": s})
 
 
 def do_list_rooms() -> Dict[str, Any]:
@@ -443,6 +501,9 @@ class Handler(BaseHTTPRequestHandler):
             body = self._read_json()
 
             if path == "/api/config":
+                # 服务器地址归一化：用户可能只填 10.20.15.27，这里补上 http://
+                if isinstance(body, dict) and "base_url" in body:
+                    body["base_url"] = adapters.normalize_base_url(body.get("base_url") or "")
                 cfg = cfgmod.save(body)
                 log("INFO", "配置已保存")
                 return self._json({"ok": True, "message": "配置已保存", "config": cfgmod.redact(cfg)})
@@ -491,21 +552,36 @@ class Handler(BaseHTTPRequestHandler):
 
 
 def main():
-    os.makedirs(os.path.join(ROOT, "logs"), exist_ok=True)
-    srv = ThreadingHTTPServer((HOST, PORT), Handler)
-    srv.daemon_threads = True
-    url = f"http://{HOST}:{PORT}/"
+    try:
+        os.makedirs(os.path.join(cfgmod.ROOT, "logs"), exist_ok=True)
+    except OSError:
+        pass          # 只读环境（如 Program Files）下忽略，日志写入会走 try/except
+    srv = bind_server()
+    if srv is None:
+        raise SystemExit("无法启动服务：没有可用端口")
+    port = srv.server_address[1]
+    url = f"http://{HOST}:{port}/"
     log("INFO", f"服务已启动: {url}")
     print("=" * 60)
     print(f"  图书馆座位预约助手  ->  {url}")
-    print("  浏览器打开上面的地址填参数；Ctrl+C 退出")
+    print("  浏览器会自动打开；关掉这个窗口即退出程序")
     print("=" * 60)
+    # 让 run.py / 外部脚本能拿到实际端口
+    os.environ["RESERVE_ACTUAL_PORT"] = str(port)
     try:
         srv.serve_forever()
     except KeyboardInterrupt:
         log("INFO", "服务退出")
     finally:
         srv.server_close()
+
+
+def current_port() -> int:
+    """返回本次实际监听的端口（供 run.py 打开浏览器用）。"""
+    try:
+        return int(os.environ.get("RESERVE_ACTUAL_PORT") or 0)
+    except ValueError:
+        return 0
 
 
 if __name__ == "__main__":

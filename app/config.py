@@ -4,12 +4,68 @@ from __future__ import annotations
 import copy
 import json
 import os
+import sys
 import threading
 from typing import Any, Dict
 
-ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-CONFIG_PATH = os.path.join(ROOT, "config.json")
-LOG_PATH = os.path.join(ROOT, "logs", "reserve.log")
+
+def _resolve_dirs() -> tuple:
+    """返回 (ROOT, DATA_DIR)。
+
+    ROOT      —— 程序所在目录（开发环境是项目目录；打包后是 exe 所在目录）
+    DATA_DIR  —— 可写目录，用于放 config.json 和 logs/
+
+    打包后双击 exe 时，exe 可能被放在 C:\\Program Files 这类只读位置，
+    所以先探测 exe 同目录能否写入；不能写就退到 %APPDATA%。
+    """
+    if getattr(sys, "frozen", False):
+        exe_dir = os.path.dirname(os.path.abspath(sys.executable))
+        root = exe_dir
+    else:
+        root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        exe_dir = root
+
+    def _writable(d: str) -> bool:
+        probe = os.path.join(d, ".write_test")
+        try:
+            os.makedirs(d, exist_ok=True)
+            with open(probe, "w", encoding="utf-8") as f:
+                f.write("x")
+            os.remove(probe)
+            return True
+        except OSError:
+            return False
+
+    # 优先级：exe 同目录（便携式）> 用户 AppData
+    if _writable(exe_dir):
+        return root, exe_dir
+
+    appdata = os.environ.get("APPDATA") or os.path.expanduser("~")
+    fallback = os.path.join(appdata, "SeatReserver")
+    if _writable(fallback):
+        return root, fallback
+
+    # 最后退回临时目录，保证程序仍能启动
+    import tempfile
+    fallback = os.path.join(tempfile.gettempdir(), "SeatReserver")
+    os.makedirs(fallback, exist_ok=True)
+    return root, fallback
+
+
+ROOT, DATA_DIR = _resolve_dirs()
+
+# 允许用环境变量指定配置文件路径。
+# 用途：测试/多实例/便携模式，避免写到默认位置（exe 同目录）。
+# 例如：set RESERVE_CONFIG=D:\tmp\test.json && Reserve.exe
+_ENV_CONFIG = os.environ.get("RESERVE_CONFIG", "").strip()
+if _ENV_CONFIG:
+    _ENV_CONFIG = os.path.abspath(_ENV_CONFIG)
+    CONFIG_PATH = _ENV_CONFIG
+    DATA_DIR = os.path.dirname(_ENV_CONFIG) or DATA_DIR
+    LOG_PATH = os.path.join(DATA_DIR, "logs", "reserve.log")
+else:
+    CONFIG_PATH = os.path.join(DATA_DIR, "config.json")
+    LOG_PATH = os.path.join(DATA_DIR, "logs", "reserve.log")
 
 DEFAULT_CONFIG: Dict[str, Any] = {
     "system": "ic",                 # 适配器: ic | generic
@@ -23,6 +79,7 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         "auto_login": True,
         "cookie": "",        # 例如 ic-cookie=xxxxxxxx-xxxx-...
         "token": "",         # 例如 eb8c6b2b68594c52be5907ef44977f60
+        "acc_no": None,      # 登录成功后自动缓存，下单 payload 的 appAccNo 用它
     },
     "target": {
         "space_id": "",      # 房间 ID (roomIds)
@@ -44,9 +101,9 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         "countdown_seconds": 0,
         "advance_ms": 0,
         "retry": True,
-        "retry_max": 3,          # ⭐ 最多重试次数（避免频繁重复发请求）
-        "retry_interval_ms": 3000,   # 重试间隔默认 3 秒，不是高频轰炸
-        "retry_timeout_s": 60,
+        "retry_max": None,       # null = 不限次数，只受 retry_timeout_s 约束
+        "retry_interval_ms": 2000,   # 重试间隔 2 秒：贴近时间窗口开放瞬间，又不高频轰炸
+        "retry_timeout_s": 1800,     # 全局上限 30 分钟，防止无限打
         "prewarm": False,        # 默认关闭预热
         "prewarm_advance_s": 60,
         "stop_on_success": True, # 成功后立即停止
@@ -57,12 +114,19 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         "verify_tls": False,
         "extra_headers": {},     # 覆盖/追加请求头
     },
+    # 接口路径。全部为实测值 —— 别再改回猜的值，改错就是 404。
     "paths": {
         "login": "/ic-web/login/user",
         "public_key": "/ic-web/login/publicKey",
+        "booking": "/ic-web/reserve/seat",          # ★ 实测：下单端点
+        "room_list": "/ic-web/room/getAll",         # 列房间
+        "seat_list": "/ic-web/reserve",             # ★ 实测：查座位
+        "room_open": "/ic-web/seatRoom/openScope",  # 开放时段
+        "seat_map": "/ic-web/seatDevice/coordinate",
+        "account_info": "/ic-web/account/info",     # 取 accNo
+        # 以下为其它系统的可能端点，保留兼容
         "seat_free": "/ic-web/seat/freeSeat",
         "space_list": "/ic-web/space/list",
-        "booking": "/ic-web/seat/booking",
         "booking_check": "/ic-web/seat/booking/check",
         "user_info": "/ic-web/user/info",
     },
@@ -121,7 +185,8 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         "rsa_padding": "pkcs1",
     },
     # 重放模板：把抓包到的 POST 原样贴进来，程序只替换 {{占位符}}
-    "replay": {        "enabled": False,
+    "replay": {
+        "enabled": False,
         "path": "",
         "content_type": "application/json;charset=UTF-8",
         "body": "",

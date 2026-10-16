@@ -36,6 +36,22 @@ class Response:
     def brief(self, limit: int = 800) -> str:
         return self.text[:limit]
 
+    def server_time(self) -> Optional[float]:
+        """从 Date 响应头解析服务器时间戳（epoch 秒）。
+
+        用途：服务器时钟可能与本机不一致（实测慢 14 秒），
+        「提前 N 分钟」的限制是按服务器时钟算的，
+        所以本地预校验必须对齐服务器时钟，否则会误判。
+        """
+        import email.utils
+        h = (self.headers or {}).get("date")
+        if not h:
+            return None
+        try:
+            return email.utils.parsedate_to_datetime(h).timestamp()
+        except Exception:
+            return None
+
 
 class Client:
     def __init__(self, timeout: float = 8.0, verify_tls: bool = False):

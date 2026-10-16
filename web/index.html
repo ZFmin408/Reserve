@@ -17,6 +17,10 @@
   <!-- ① 账号 -->
   <section class="card">
     <h2>账号</h2>
+    <label>服务器地址
+      <input id="base_url" placeholder="如 10.20.15.27 或 10.20.15.27:8080（不用写 http://）" />
+      <span class="tip">只填 IP 即可，程序会自动补 <code>http://</code></span>
+    </label>
     <div class="row2">
       <label>学号
         <input id="username" autocomplete="off" placeholder="请输入学号" />
@@ -77,17 +81,31 @@
           <option value="19:00">19:00</option>
           <option value="21:00">21:00</option>
           <option value="22:00">22:00</option>
+          <option value="__custom__">自定义…</option>
         </select>
       </label>
     </div>
+    <label id="fire_time_custom_wrap" class="hidden">自定义定时时间
+      <input id="fire_time_custom" placeholder="HH:MM 或 HH:MM:SS，例如 13:01 或 06:59:30" />
+    </label>
 
     <label>预约时段
       <select id="slot">
         <option value="morning">上午（08:00 - 12:00）</option>
         <option value="afternoon" selected>下午（13:30 - 18:00）</option>
         <option value="evening">晚上（19:00 - 22:00）</option>
+        <option value="__custom__">自定义时间段…</option>
       </select>
     </label>
+    <div class="row2 hidden" id="slot_custom_wrap">
+      <label>开始时间
+        <input id="slot_start" placeholder="HH:MM，例如 09:30" />
+      </label>
+      <label>结束时间
+        <input id="slot_end" placeholder="HH:MM，例如 11:30" />
+      </label>
+    </div>
+    <p class="hint hidden" id="slot_custom_hint"></p>
 
     <p class="hint" id="summary"></p>
 

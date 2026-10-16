@@ -45,8 +45,11 @@ def check(name: str, cond: bool, extra: str = "") -> None:
 class FakeServer:
     """假图书馆：登录永远成功；下单单失败，直到第 N 次成功。"""
 
-    def __init__(self, succeed_at: int = 3):
+    def __init__(self, succeed_at: int = 3, fail_message: str = "该时段已被预约",
+                 fail_code: int = 1):
         self.succeed_at = succeed_at
+        self.fail_message = fail_message
+        self.fail_code = fail_code
         self.kind_requests = 0        # 查座位/房间等 GET
         self.public_key_requests = 0
         self.login_requests = 0
@@ -93,7 +96,8 @@ class FakeServer:
                     if outer.booking_requests >= outer.succeed_at:
                         return self._send({"code": 0, "message": "新增成功", "data": {
                             "resvId": 104285735, "uuid": "abc123", "resvDate": 20261016}})
-                    return self._send({"code": 1, "message": "该时段已被预约", "data": None})
+                    return self._send({"code": outer.fail_code,
+                                       "message": outer.fail_message, "data": None})
                 return self._send({"code": 0, "message": "ok", "data": {}})
 
         self.srv = ThreadingHTTPServer(("127.0.0.1", 0), H)
@@ -162,7 +166,7 @@ def _run_all() -> int:
                         "rsa_padding": "pkcs1"},
             "target": {"seat_id": "100493961", "space_id": "100492996",
                        "reserve_date": "2026-10-16", "slot": "afternoon"},
-            # 故意把间隔配成 80ms，验证后端会强制抬到下限（要求：不要频繁重复发送）
+            # 故意把间隔配成 80ms，验证实际受 200ms 最小值保护
             "schedule": {"mode": "countdown", "countdown_seconds": 0, "advance_ms": 0,
                          "retry": True, "retry_max": 3, "retry_interval_ms": 80,
                          "retry_timeout_s": 30, "prewarm": False, "prewarm_advance_s": 60},
@@ -196,12 +200,13 @@ def _run_all() -> int:
         check("调度线程已退出",
               not any(t.name == "reserve-scheduler" and t.is_alive() for t in threading.enumerate()))
 
-        # ★ 要求：不要频繁重复发送 -> 即使配置 80ms，实际间隔也被抬到 >=3 秒
+        # 重试间隔按配置生效（不再有 3 秒硬下限，支持 1~2 秒的紧密重试）
         if len(srv.booking_times) >= 2:
             gaps = [round(srv.booking_times[i + 1] - srv.booking_times[i], 2)
                     for i in range(len(srv.booking_times) - 1)]
-            print(f"  两次请求间隔(秒): {gaps}  （配置写了 80ms，后端下限 3s）")
-            check("★ 间隔被强制抬到 >=3 秒（不密集发送）", all(g >= 2.9 for g in gaps), str(gaps))
+            print(f"  两次请求间隔(秒): {gaps}  （配置 80ms，实际受最小 200ms 保护）")
+            check("★ 间隔按配置生效且受 200ms 最小值保护",
+                  all(g >= 0.2 for g in gaps), str(gaps))
 
         check("日志里出现预约成功", any("预约成功" in x or "SUCCESS" in x for x in logs))
     finally:
@@ -356,6 +361,83 @@ def _run_all() -> int:
         sch4.stop()
     finally:
         srv4.stop()
+
+    print()
+    print("=" * 72)
+    print("  5. 暂时性错误 -> 每 2 秒持续重试直到成功（模拟「时间窗口刚开放」）")
+    print("=" * 72)
+    IcAdapter._current_acc_no = lambda self: 100510484
+    IcAdapter._build_booking_payload = lambda self, acc, slot="": (
+        {"sysKind": 8, "appAccNo": acc, "resvMember": [acc],
+         "encryptVlaue": "STUB", "resvDevEncrypts": ["STUB"]}, "stub")
+    # 前 3 次报「不在提前预约时间范围内」，第 4 次成功
+    srv5 = FakeServer(succeed_at=4, fail_message="不在提前预约时间范围内", fail_code=1)
+    try:
+        cfgmod.save({
+            "base_url": srv5.base,
+            "target": {"seat_id": "100495052", "space_id": "100494721", "slot": "evening"},
+            "schedule": {"retry": True, "retry_max": None, "retry_interval_ms": 1000,
+                         "retry_timeout_s": 60, "prewarm": False},
+            "session": {"auto_login": True, "token": "", "cookie": ""},
+        })
+        logs5 = []
+        sch5 = Scheduler(lambda lv, m: logs5.append(f"{lv} {m}"))
+        t0 = time.time()
+        sch5.trigger_after(delay_s=0.1)
+        dl = time.time() + 30
+        while time.time() < dl:
+            if sch5.state_snapshot()["status"] in ("success", "failed", "stopped"):
+                break
+            time.sleep(0.05)
+        st5 = sch5.state_snapshot()["status"]
+        n5 = srv5.booking_requests
+        span = time.time() - t0
+        print(f"  status={st5}  下单请求数={n5}  尝试次数={sch5.state_snapshot()['attempts']}"
+              f"  总耗时={span:.1f}s")
+        check("暂时性错误 -> 最终成功", st5 == "success", st5)
+        check("★ 一直重试到第 4 次成功", n5 == 4, f"实际 {n5}")
+        check("★ 重试间隔约 1 秒（未受硬下限限制）", span < 12, f"{span:.1f}s")
+        if len(srv5.booking_times) >= 2:
+            gaps = [round(srv5.booking_times[i+1] - srv5.booking_times[i], 2)
+                    for i in range(len(srv5.booking_times)-1)]
+            print(f"  实际间隔(秒): {gaps}")
+            check("间隔接近配置的 1 秒", all(0.8 <= g <= 2.0 for g in gaps), str(gaps))
+        check("日志记录了持续重试", any("准备重试" in x for x in logs5))
+    finally:
+        srv5.stop()
+
+    print()
+    print("=" * 72)
+    print("  6. 确定性错误（参数错误 code=100）-> 立刻停止，不重试")
+    print("=" * 72)
+    srv6 = FakeServer(succeed_at=10 ** 9, fail_message="请求参数错误", fail_code=100)
+    try:
+        cfgmod.save({
+            "base_url": srv6.base,
+            "schedule": {"retry": True, "retry_max": None, "retry_interval_ms": 1000,
+                         "retry_timeout_s": 30, "prewarm": False},
+            "session": {"auto_login": True, "token": "", "cookie": ""},
+        })
+        logs6 = []
+        sch6 = Scheduler(lambda lv, m: logs6.append(f"{lv} {m}"))
+        t0 = time.time()
+        sch6.trigger_after(delay_s=0.1)
+        dl = time.time() + 15
+        while time.time() < dl:
+            if sch6.state_snapshot()["status"] in ("success", "failed", "stopped"):
+                break
+            time.sleep(0.05)
+        st6 = sch6.state_snapshot()["status"]
+        n6 = srv6.booking_requests
+        span = time.time() - t0
+        print(f"  status={st6}  下单请求数={n6}  尝试次数={sch6.state_snapshot()['attempts']}"
+              f"  耗时={span:.1f}s")
+        check("参数错误 -> 状态 failed", st6 == "failed", st6)
+        check("★ 只发 1 次，不重试", n6 == 1, f"实际 {n6}")
+        check("★ 很快结束（没有耗到 30 秒超时）", span < 5, f"{span:.1f}s")
+        check("日志说明不可重试", any("不可重试" in x for x in logs6))
+    finally:
+        srv6.stop()
 
     print()
     print("=" * 72)

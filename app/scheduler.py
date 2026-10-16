@@ -267,7 +267,12 @@ class Scheduler:
                 s["token"] = client.extra_headers["token"]
             if client.cookies:
                 s["cookie"] = client.cookie_header()
-            cfg["_login_cache"] = {"user_id": detail.get("user_id"), "lib_id": detail.get("lib_id")}
+            # accNo 必须一起缓存：下单 payload 的 appAccNo/resvMember 用它。
+            # （以前只写 _login_cache，预热关闭后就拿不到了）
+            acc = detail.get("accNo") or detail.get("user_id")
+            if acc is not None:
+                s["acc_no"] = acc
+            cfg["_login_cache"] = {"user_id": acc, "lib_id": detail.get("lib_id")}
             self._cached_cfg = cfg
         return ok
 
@@ -283,11 +288,14 @@ class Scheduler:
         - **成功立即停止**：一收到成功就返回，不再发任何请求
         """
         retry = bool(sch.get("retry", True))
-        # ★ 要求「不要频繁重复发送请求」：重试间隔设下限，防止配置被写成高频轰炸
-        raw_interval = float(sch.get("retry_interval_ms") or 3000) / 1000.0
-        interval = max(MIN_RETRY_INTERVAL_S, raw_interval)
-        retry_max = int(sch.get("retry_max") if sch.get("retry_max") is not None else 3)
-        deadline = time.time() + float(sch.get("retry_timeout_s") or 60)
+        # 重试间隔可配置。默认 2 秒 —— 够贴近「时间窗口刚开放」的瞬间，
+        # 又不至于高频轰炸服务器。配置里写多小就用多小（去掉硬下限）。
+        interval = max(0.2, float(sch.get("retry_interval_ms") or 2000) / 1000.0)
+        # retry_max=None 表示不限次数，只受 retry_timeout_s 约束
+        raw_max = sch.get("retry_max")
+        retry_max = None if raw_max is None else int(raw_max)
+        timeout_s = float(sch.get("retry_timeout_s") or 0)
+        deadline = (time.time() + timeout_s) if timeout_s > 0 else None
         attempts = 0
 
         client = self._client(cfg)
@@ -310,18 +318,29 @@ class Scheduler:
             if ok:
                 self.log("SUCCESS", f"预约成功（第 {attempts} 次）: {msg}，已停止发送请求")
                 return True
-            # 构造类错误是确定性的，重试无意义 —— 立刻放弃
+
+            # 确定性失败（未登录 / 参数错 / 座位不存在）—— 重试无意义，立刻放弃
             if detail.get("fatal"):
-                self.log("ERROR", f"致命错误，放弃重试: {msg}")
+                self.log("ERROR", f"不可重试的错误，已停止: {msg}")
                 self._set(status="failed")
                 return False
-            if not retry or self._stop.is_set() or time.time() >= deadline:
+
+            # 时间窗口没到 / 被抢先 —— 属于可重试
+            kind = detail.get("kind") or "transient"
+            self.log("INFO", f"第 {attempts} 次未成功（{kind}），准备重试: {msg[:80]}")
+
+            if not retry or self._stop.is_set():
                 return False
-            # 次数上限：最多重试 retry_max 次，避免频繁重复发送
-            if attempts > retry_max:
+            if deadline is not None and time.time() >= deadline:
+                self.log("WARN", f"已达重试超时（{timeout_s:.0f} 秒），停止发送请求")
+                return False
+            if retry_max is not None and attempts > retry_max:
                 self.log("WARN", f"已达重试上限（{retry_max} 次），停止发送请求")
                 return False
-            time.sleep(interval)
+
+            # 服务器若给了「还要等多久」，就睡够再试；否则用配置间隔
+            wait = float(detail.get("retry_after_s") or 0)
+            time.sleep(max(interval, min(wait, 300.0)))
 
     def _once_safe(self):
         try:
